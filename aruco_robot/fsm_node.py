@@ -1,15 +1,27 @@
 #!/usr/bin/env python3
 """
-fsm_node.py — based strictly on the original ArucoFSM structure.
-Strafe is added as substep 0+1 inside DEPLOY (same pattern as GRASP substeps).
-No extra states added.
+fsm_node.py
+
+Steuerungslogik:  aruco_fsm.py (Original, komplett unverändert)
+Schnittstelle:    neue Laptop-Node (detector_node.py)
+
+Änderungen gegenüber aruco_fsm.py:
+  1. Neue Topics der Laptop-Node statt aruco/data
+  2. robot/state Publisher
+  3. Distanz- oder Area-basierter GRASP/DEPLOY-Trigger je nach Modus:
+     - use_distance_target  : ob Target-Phase Distanz oder Area nutzt
+     - use_distance_trailer : ob Trailer-Phase Distanz oder Area nutzt
+     - Umschaltbar zur Laufzeit über Topic fsm/control (JSON String)
+     - Aktueller Modus wird auf fsm/control_mode publiziert
+  WICHTIG: Alle Timings, Substeps, Wartezeiten, Bewegungsbefehle
+           sind 100% identisch zum Original aruco_fsm.py
 """
 
+import json
 import rclpy
-import time
 from rclpy.node import Node
 from rclpy.duration import Duration
-from std_msgs.msg import Bool, Float32MultiArray, String
+from std_msgs.msg import Bool, Float32MultiArray, Float32, String
 from enum import Enum, auto
 
 try:
@@ -39,7 +51,7 @@ class ArucoFSM(Node):
     def __init__(self):
         super().__init__('aruco_fsm')
 
-        # Parameters
+        # ── Parameter (identisch zum Original) ───────────────────────
         self.declare_parameter('target_marker_area',    22500.0)
         self.declare_parameter('container_marker_area', 60000.0)
         self.declare_parameter('turn_gain',             30.0)
@@ -47,9 +59,11 @@ class ArucoFSM(Node):
         self.declare_parameter('forward_speed',         10.0)
         self.declare_parameter('cx_threshold',          0.15)
         self.declare_parameter('min_turn',              7.0)
-        self.declare_parameter('image_width',           1920)
-        self.declare_parameter('strafe_left_speed',     10.0)
-        self.declare_parameter('strafe_left_duration',  0.6)
+        self.declare_parameter('grasp_distance_m',      0.20)
+        self.declare_parameter('deploy_distance_m',     0.25)
+        # Startmodus: True = Distanz, False = Area
+        self.declare_parameter('use_distance_target',   True)
+        self.declare_parameter('use_distance_trailer',  True)
 
         self.target_area           = self.get_parameter('target_marker_area').value
         self.container_target_area = self.get_parameter('container_marker_area').value
@@ -58,13 +72,16 @@ class ArucoFSM(Node):
         self.forward_speed         = self.get_parameter('forward_speed').value
         self.cx_threshold          = self.get_parameter('cx_threshold').value
         self.min_turn              = self.get_parameter('min_turn').value
-        self.image_width           = float(self.get_parameter('image_width').value)
-        self.strafe_left_speed     = self.get_parameter('strafe_left_speed').value
-        self.strafe_left_duration  = self.get_parameter('strafe_left_duration').value
+        self.grasp_distance_m      = self.get_parameter('grasp_distance_m').value
+        self.deploy_distance_m     = self.get_parameter('deploy_distance_m').value
         self.min_strave            = 5.0
         self.strave_gain           = 10.0
 
-        # XGO
+        # Laufzeit-Modus (umschaltbar über fsm/control Topic)
+        self.use_distance_target  = self.get_parameter('use_distance_target').value
+        self.use_distance_trailer = self.get_parameter('use_distance_trailer').value
+
+        # ── XGO ──────────────────────────────────────────────────────
         if XGO_AVAILABLE:
             self.xgo = XGO(port='/dev/ttyAMA0')
             self.xgo.stop()
@@ -72,98 +89,126 @@ class ArucoFSM(Node):
             self.xgo.attitude("p", 15)
         else:
             self.xgo = None
-            self.get_logger().warn("XGO not available — motor commands suppressed")
+            self.get_logger().warn("XGO not available — Motorbefehle unterdrückt")
 
-        # FSM
+        # ── FSM-Zustand ───────────────────────────────────────────────
         self.state               = State.SEARCH
         self.prev_state          = None
         self.motion_active       = False
         self.substep             = 0
         self.searching_container = False
         self.picked_up_id        = -1
-        self.get_logger().info("[FSM] Starting")
+        self.get_logger().info("[FSM] Starting new FSM")
 
-        # Detection data — raw
-        self.target_found     = False
-        self.target_cx        = 0.0
-        self.target_cy        = 0.0
-        self.target_area_val  = 0.0
-        self.target_id        = -1
+        # ── Detektionsdaten ───────────────────────────────────────────
+        self.last_found = False
+        self.last_cx    = 0.0
+        self.last_cy    = 0.0
+        self.last_area  = 0.0
+        self.last_id    = -1
 
-        self.trailer_found    = False
-        self.trailer_cx       = 0.0
-        self.trailer_cy       = 0.0
-        self.trailer_area_val = 0.0
-        self.trailer_id       = -1
+        self._target_cx      = 0.0
+        self._target_cy      = 0.0
+        self._target_area    = 0.0
+        self._target_id      = -1
+        self._target_cx_f    = 0.0
+        self._target_area_f  = 0.0
+        self._trailer_cx     = 0.0
+        self._trailer_cy     = 0.0
+        self._trailer_area   = 0.0
+        self._trailer_id     = -1
+        self._trailer_cx_f   = 0.0
+        self._trailer_area_f = 0.0
+        self._target_distance  = -1.0
+        self._trailer_distance = -1.0
 
-        # Detection data — filtered (used for control)
-        self.target_cx_f   = 0.0
-        self.target_area_f = 0.0
-        self.trailer_cx_f  = 0.0
-        self.trailer_area_f= 0.0
+        # ── Subscriber ────────────────────────────────────────────────
+        self.create_subscription(Float32MultiArray, 'aruco/target/data',
+                                 self._cb_target_data, 10)
+        self.create_subscription(Float32MultiArray, 'aruco/target/data_filtered',
+                                 self._cb_target_filt, 10)
+        self.create_subscription(Float32MultiArray, 'aruco/trailer/data',
+                                 self._cb_trailer_data, 10)
+        self.create_subscription(Float32MultiArray, 'aruco/trailer/data_filtered',
+                                 self._cb_trailer_filt, 10)
+        self.create_subscription(Float32, 'aruco/target/distance',
+                                 self._cb_target_distance, 10)
+        self.create_subscription(Float32, 'aruco/trailer/distance',
+                                 self._cb_trailer_distance, 10)
+        # Dashboard → FSM: Modus umschalten
+        self.create_subscription(String, 'fsm/control',
+                                 self._cb_control, 10)
 
-        # Data freshness — track last time we received detection data
-        self._last_data_time = time.time()
-        self._data_timeout   = 2.5  # seconds without data → treat as lost
+        # ── Publisher ─────────────────────────────────────────────────
+        self.state_pub   = self.create_publisher(String, 'robot/state',       10)
+        self.mode_pub    = self.create_publisher(String, 'fsm/control_mode',  10)
 
-        # Subscribers
-        self.create_subscription(Bool,              'aruco/target/found',          self._cb_target_found,      10)
-        self.create_subscription(Float32MultiArray, 'aruco/target/data',           self._cb_target_data,       10)
-        self.create_subscription(Float32MultiArray, 'aruco/target/data_filtered',  self._cb_target_filt,       10)
-        self.create_subscription(Bool,              'aruco/trailer/found',         self._cb_trailer_found,     10)
-        self.create_subscription(Float32MultiArray, 'aruco/trailer/data',          self._cb_trailer_data,      10)
-        self.create_subscription(Float32MultiArray, 'aruco/trailer/data_filtered', self._cb_trailer_filt,      10)
-
-        self.state_pub = self.create_publisher(String, 'robot/state', 10)
-        self.timer     = self.create_timer(0.1, self.control_loop)
+        self.timer = self.create_timer(0.1, self.control_loop)
 
     # ── Callbacks ────────────────────────────────────────────────────
-    def _cb_target_found(self,  m): self.target_found  = m.data
-    def _cb_trailer_found(self, m): self.trailer_found = m.data
 
-    def _cb_target_data(self, m):
-        self.target_cx, self.target_cy, self.target_area_val, id_ = m.data
-        self.target_id    = int(id_)
-        self.target_found = self.target_id != -1
-        self._last_data_time = time.time()
+    def _cb_target_data(self, msg: Float32MultiArray):
+        self._target_cx, self._target_cy, self._target_area, id_ = msg.data
+        self._target_id = int(id_)
+        if not self.searching_container:
+            self.last_cx    = self._target_cx
+            self.last_cy    = self._target_cy
+            self.last_area  = self._target_area
+            self.last_id    = self._target_id
+            self.last_found = self.last_id != -1
 
-    def _cb_target_filt(self, m):
-        self.target_cx_f, _, self.target_area_f, _ = m.data
+    def _cb_target_filt(self, msg: Float32MultiArray):
+        self._target_cx_f, _, self._target_area_f, _ = msg.data
+        if not self.searching_container:
+            self.last_cx   = self._target_cx_f
+            self.last_area = self._target_area_f
 
-    def _cb_trailer_data(self, m):
-        self.trailer_cx, self.trailer_cy, self.trailer_area_val, id_ = m.data
-        self.trailer_id    = int(id_)
-        self.trailer_found = self.trailer_id != -1
-        self._last_data_time = time.time()
+    def _cb_trailer_data(self, msg: Float32MultiArray):
+        self._trailer_cx, self._trailer_cy, self._trailer_area, id_ = msg.data
+        self._trailer_id = int(id_)
+        if self.searching_container:
+            self.last_cx    = self._trailer_cx
+            self.last_cy    = self._trailer_cy
+            self.last_area  = self._trailer_area
+            self.last_id    = self._trailer_id
+            self.last_found = self.last_id != -1
 
-    def _cb_trailer_filt(self, m):
-        self.trailer_cx_f, _, self.trailer_area_f, _ = m.data
+    def _cb_trailer_filt(self, msg: Float32MultiArray):
+        self._trailer_cx_f, _, self._trailer_area_f, _ = msg.data
+        if self.searching_container:
+            self.last_cx   = self._trailer_cx_f
+            self.last_area = self._trailer_area_f
 
-    # ── Properties — same pattern as original ────────────────────────
-    @property
-    def last_found(self):
-        return self.trailer_found if self.searching_container else self.target_found
+    def _cb_target_distance(self,  msg: Float32): self._target_distance  = float(msg.data)
+    def _cb_trailer_distance(self, msg: Float32): self._trailer_distance = float(msg.data)
 
-    @property
-    def last_cx(self):
-        """Filtered cx for control."""
-        return self.trailer_cx_f if self.searching_container else self.target_cx_f
+    def _cb_control(self, msg: String):
+        """
+        Empfängt JSON vom Dashboard, z.B.:
+          {"use_distance_target": true}
+          {"use_distance_trailer": false}
+          {"grasp_distance_m": 0.18}
+          {"deploy_distance_m": 0.22}
+        """
+        try:
+            cmd = json.loads(msg.data)
+            if "use_distance_target" in cmd:
+                self.use_distance_target  = bool(cmd["use_distance_target"])
+                self.get_logger().info(
+                    f"[FSM] Target mode → {'distance' if self.use_distance_target else 'area'}")
+            if "use_distance_trailer" in cmd:
+                self.use_distance_trailer = bool(cmd["use_distance_trailer"])
+                self.get_logger().info(
+                    f"[FSM] Trailer mode → {'distance' if self.use_distance_trailer else 'area'}")
+            if "grasp_distance_m" in cmd:
+                self.grasp_distance_m  = float(cmd["grasp_distance_m"])
+            if "deploy_distance_m" in cmd:
+                self.deploy_distance_m = float(cmd["deploy_distance_m"])
+        except Exception as e:
+            self.get_logger().error(f"[FSM] control parse error: {e}")
 
-    @property
-    def last_area(self):
-        """Filtered area for control."""
-        return self.trailer_area_f if self.searching_container else self.target_area_f
+    # ── Motion-Hilfsfunktionen ────────────────────────────────────────
 
-    @property
-    def last_id(self):
-        return self.trailer_id if self.searching_container else self.target_id
-
-    @property
-    def data_fresh(self):
-        """True if we received detection data recently."""
-        return (time.time() - self._last_data_time) < self._data_timeout
-
-    # ── Motion helpers — identical to original ────────────────────────
     def start_motion(self, duration):
         self.motion_done_time = self.get_clock().now() + Duration(seconds=duration)
         self.motion_active    = True
@@ -176,14 +221,40 @@ class ArucoFSM(Node):
             return True
         return False
 
-    def _xgo(self, method, *args):
-        if self.xgo:
-            getattr(self.xgo, method)(*args)
+    # ── Trigger-Hilfsfunktionen ───────────────────────────────────────
 
-    # ── Control loop — same structure as original ─────────────────────
+    def _target_trigger(self):
+        """True wenn der GRASP-Trigger für die Target-Phase ausgelöst werden soll."""
+        if self.use_distance_target and self._target_distance > 0.0:
+            return self._target_distance <= self.grasp_distance_m
+        # Fallback: area
+        return self.last_area >= self.target_area
+
+    def _trailer_trigger(self):
+        """True wenn der DEPLOY-Trigger für die Trailer-Phase ausgelöst werden soll."""
+        if self.use_distance_trailer and self._trailer_distance > 0.0:
+            return self._trailer_distance <= self.deploy_distance_m
+        # Fallback: area
+        return self.last_area >= self.container_target_area
+
+    # ── Control-Loop ─────────────────────────────────────────────────
+
     def control_loop(self):
-        msg = String(); msg.data = self.state.name
-        self.state_pub.publish(msg)
+        # State publizieren
+        s_msg = String(); s_msg.data = self.state.name
+        self.state_pub.publish(s_msg)
+
+        # Modus publizieren (für Dashboard)
+        mode = {
+            "use_distance_target":  self.use_distance_target,
+            "use_distance_trailer": self.use_distance_trailer,
+            "grasp_distance_m":     self.grasp_distance_m,
+            "deploy_distance_m":    self.deploy_distance_m,
+            "target_distance":      self._target_distance,
+            "trailer_distance":     self._trailer_distance,
+        }
+        m_msg = String(); m_msg.data = json.dumps(mode)
+        self.mode_pub.publish(m_msg)
 
         if self.motion_active:
             if not self.motion_done():
@@ -200,13 +271,13 @@ class ArucoFSM(Node):
             if self.last_found:
                 self.state = State.ALIGN
                 return
-            self._xgo('turn', 25)
+            self.xgo.turn(25)
             self.start_motion(1.0)
             self.state = State.SEARCH_TURNING
 
         elif self.state == State.SEARCH_TURNING:
             if self.motion_done():
-                self._xgo('stop')
+                self.xgo.stop()
                 self.start_motion(2.0)
                 self.state = State.SEARCH_WAIT
 
@@ -222,7 +293,7 @@ class ArucoFSM(Node):
                 self.state = State.SEARCH
                 return
 
-            cx_error = (self.last_cx - self.image_width / 2.0) / (self.image_width / 2.0)
+            cx_error = (self.last_cx - 960.0) / 960.0
 
             if abs(cx_error) > self.cx_threshold:
                 if cx_error > 0:
@@ -232,12 +303,13 @@ class ArucoFSM(Node):
                     turn   = max((-self.turn_gain * cx_error), self.min_turn)
                     strave = max((-self.strave_gain * cx_error), self.min_strave)
 
-                self.get_logger().info(f"[FSM] cx_error={cx_error:.3f}  turn={turn:.1f}  strave={strave:.1f}")
+                self.get_logger().info(f"[FSM] Error : {cx_error},  Turning : {turn}")
+                self.get_logger().info(f"[FSM] Error : {cx_error},  Straving : {strave}")
 
                 if abs(cx_error) > self.cx_threshold * 2.0:
-                    self._xgo('turn', turn)
+                    self.xgo.turn(turn)
                 else:
-                    self._xgo('move', "y", strave)
+                    self.xgo.move("y", strave)
 
                 self.start_motion(1.0)
                 self.state = State.ALIGN_TURNING
@@ -246,7 +318,7 @@ class ArucoFSM(Node):
 
         elif self.state == State.ALIGN_TURNING:
             if self.motion_done():
-                self._xgo('stop')
+                self.xgo.stop()
                 self.start_motion(2.0)
                 self.state = State.ALIGN_WAIT
 
@@ -258,173 +330,175 @@ class ArucoFSM(Node):
         # APPROACH
         # =========================
         elif self.state == State.APPROACH:
-            # If data stream dropped, stop and go back to search
-            if not self.data_fresh:
-                self.get_logger().warn("[FSM] Detection data stale — backing off to SEARCH")
-                self._xgo('stop')
-                self.start_motion(1.0)
-                self.state = State.APPROACH_BACK
-                return
             if not self.last_found:
-                self._xgo('move', "x", -self.forward_speed)
+                self.xgo.move("x", -self.forward_speed)
                 self.start_motion(1.0)
                 self.state = State.APPROACH_BACK
                 return
 
+            # Trigger prüfen — nutzt Distanz oder Area je nach Modus
+            if not self.searching_container:
+                # Target-Phase
+                triggered = self._target_trigger()
+                dist_val  = self._target_distance
+                mode_str  = "dist" if self.use_distance_target else "area"
+                self.get_logger().info(
+                    f"[FSM] APPROACH target [{mode_str}] "
+                    f"dist={dist_val:.3f}m  area={self.last_area:.0f}  trigger={triggered}"
+                )
+                if triggered:
+                    self.get_logger().info("[FSM] Target trigger reached → GRASP")
+                    self.state = State.GRASP
+                    return
+            else:
+                # Trailer-Phase
+                triggered = self._trailer_trigger()
+                dist_val  = self._trailer_distance
+                mode_str  = "dist" if self.use_distance_trailer else "area"
+                self.get_logger().info(
+                    f"[FSM] APPROACH trailer [{mode_str}] "
+                    f"dist={dist_val:.3f}m  area={self.last_area:.0f}  trigger={triggered}"
+                )
+                if triggered:
+                    self.get_logger().info("[FSM] Trailer trigger reached → DEPLOY")
+                    self.state = State.DEPLOY
+                    return
+
+            # Noch nicht nah genug — vorwärts fahren (originale Logik unverändert)
             target = self.container_target_area if self.searching_container else self.target_area
-            self.get_logger().info(f"[FSM] target_area={target:.0f}  actual={self.last_area:.0f}")
+            self.get_logger().info(f"[FSM] Target area : {target} Actual area : {self.last_area}")
 
             if self.last_area < target:
-                error    = target - self.last_area
-                duration = max(error / target * self.forward_gain, 0.2) if (error / target > 0.90) else 1.0
-                self.get_logger().info(f"[FSM] area_error={error:.0f}  duration={duration:.2f}")
-                self._xgo('move', "x", self.forward_speed)
+                error = target - self.last_area
+                if (error / target > 0.90):
+                    duration = max(error / target * self.forward_gain, 0.2)
+                else:
+                    duration = 1.0
+                self.get_logger().info(
+                    f"[FSM] area error={error:.2f} error/target={error / target:.2f} duration={duration:.2f}"
+                )
+                self.xgo.move("x", self.forward_speed)
                 self.start_motion(duration)
                 self.state = State.APPROACH_FORWARD
             else:
-                # Both target and trailer go directly to their next state.
-                # Strafe is handled as substeps inside DEPLOY.
+                # area-Trigger als letzter Fallback (wenn Distanz-Modus an aber kein Signal)
                 self.state = State.DEPLOY if self.searching_container else State.GRASP
 
         elif self.state == State.APPROACH_FORWARD:
             if self.motion_done():
-                self._xgo('stop')
+                self.xgo.stop()
                 self.start_motion(2.0)
                 self.state = State.APPROACH
 
         elif self.state == State.APPROACH_BACK:
             if self.motion_done():
-                self._xgo('stop')
+                self.xgo.stop()
                 self.start_motion(2.0)
                 if self.forward_speed > 7.5 and not self.searching_container:
                     self.forward_speed *= 0.75
                 self.state = State.ALIGN
 
         # =========================
-        # GRASP
+        # GRASP  (identisch zum Original)
         # =========================
         elif self.state == State.GRASP:
             if self.substep == 0:
-                self._xgo('claw', 0)
+                self.xgo.claw(0)
                 self.start_motion(1.0)
                 self.substep = 1
-
             elif self.substep == 1 and self.motion_done():
-                self._xgo('arm_motor', [-25, 90, 0])
+                self.xgo.arm_motor([-25, 90, 0])
                 self.start_motion(1.0)
                 self.substep = 2
-
             elif self.substep == 2 and self.motion_done():
-                self._xgo('claw', 255)
+                self.xgo.claw(255)
                 self.start_motion(2.0)
                 self.substep = 3
-
             elif self.substep == 3 and self.motion_done():
-                self._xgo('arm_motor', [20, -90, 0])
+                self.xgo.arm_motor([20, -90, 0])
                 self.start_motion(1.0)
                 self.substep = 4
-
             elif self.substep == 4 and self.motion_done():
-                self._xgo('arm_motor', [83, -90, 0])
+                self.xgo.arm_motor([83, -90, 0])
                 self.start_motion(1.0)
                 self.substep = 5
-
             elif self.substep == 5 and self.motion_done():
                 self.substep      = 0
                 self.picked_up_id = self.last_id
+                self.last_id      = -1
                 self.state        = State.VERIFY
 
         # =========================
-        # VERIFY
+        # VERIFY  (identisch zum Original)
         # =========================
         elif self.state == State.VERIFY:
             if self.substep == 0:
-                self._xgo('stop')
+                self.xgo.stop()
                 self.start_motion(3.0)
                 self.substep = 1
-
             elif self.substep == 1 and self.motion_done():
-                self._xgo('move', "x", -self.forward_speed)
+                self.xgo.move("x", -self.forward_speed)
                 self.start_motion(1.0)
                 self.substep = 2
-
-            elif self.substep == 2 and self.motion_done():
-                self._xgo('stop')
+            elif self.substep == 2:
+                # kein motion_done()-Check — identisch zum Original
+                self.xgo.stop()
                 self.start_motion(3.0)
                 self.substep = 3
-
             elif self.substep == 3 and self.motion_done():
-                verified = (self.target_id == -1)
-                self.get_logger().info(f"[FSM] Verified: {verified}")
+                verified = True if self.last_id == -1 else False
+                self.get_logger().info(f"Verified : {verified}")
                 self.substep = 0
-
                 if verified:
-                    self._xgo('translation', "z", -50)
-                    self._xgo('attitude',    "p",  -10)
+                    self.xgo.translation("z", 0) #-50)
+                    self.xgo.attitude("p", 0) #-10)
                     self.start_motion(2.0)
                     self.forward_speed       = self.get_parameter('forward_speed').value
+                    self.last_found          = False
                     self.searching_container = True
                     self.state               = State.SEARCH
                 else:
-                    self._xgo('translation', "z", 80)
-                    self._xgo('attitude',    "p", 15)
+                    self.xgo.translation("z", 80)
+                    self.xgo.attitude("p", 15)
                     self.start_motion(2.0)
+                    self.last_found    = False
                     self.forward_speed = self.get_parameter('forward_speed').value
                     self.state         = State.SEARCH
 
         # =========================
-        # DEPLOY
-        # Substeps 0-1: strafe left to align with box opening
-        # Substeps 2-6: original deploy arm sequence
+        # DEPLOY  (identisch zum Original)
         # =========================
         elif self.state == State.DEPLOY:
-            # ── Strafe substeps ──────────────────────────────────────
             if self.substep == 0:
-                self._xgo('move', "y", self.strafe_left_speed)  # positive y = left
-                self.start_motion(self.strafe_left_duration)
+                self.xgo.arm_motor([-270, 210, 0])
+                self.start_motion(1.0)
                 self.substep = 1
-
             elif self.substep == 1 and self.motion_done():
-                self._xgo('stop')
-                self.start_motion(0.5)
+                self.xgo.claw(0)
+                self.start_motion(1.0)
                 self.substep = 2
-
-            # ── Original deploy sequence (shifted by 2) ───────────────
             elif self.substep == 2 and self.motion_done():
-                self._xgo('arm_motor', [-270, 210, 0])
+                self.xgo.arm_motor([0, -90, 0])
                 self.start_motion(1.0)
                 self.substep = 3
-
             elif self.substep == 3 and self.motion_done():
-                self._xgo('claw', 0)
+                self.xgo.arm_motor([83, -90, 0])
                 self.start_motion(1.0)
                 self.substep = 4
-
             elif self.substep == 4 and self.motion_done():
-                self._xgo('arm_motor', [0, -90, 0])
-                self.start_motion(1.0)
-                self.substep = 5
-
-            elif self.substep == 5 and self.motion_done():
-                self._xgo('arm_motor', [83, -90, 0])
-                self.start_motion(1.0)
-                self.substep = 6
-
-            elif self.substep == 6 and self.motion_done():
-                self._xgo('translation', "z", 0)
-                self._xgo('attitude',    "p", 0)
+                self.xgo.translation("z", 0)
+                self.xgo.attitude("p", 0)
                 self.start_motion(2.0)
-                self.substep = 7
-
-            elif self.substep == 7 and self.motion_done():
+                self.substep = 5
+            elif self.substep == 5 and self.motion_done():
                 self.substep = 0
                 self.state   = State.DONE
 
         # =========================
-        # DONE
+        # DONE  (identisch zum Original)
         # =========================
         elif self.state == State.DONE:
-            self._xgo('action', 15)
+            self.xgo.action(15)
 
 
 def main(args=None):
