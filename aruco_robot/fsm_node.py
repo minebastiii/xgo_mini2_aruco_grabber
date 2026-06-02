@@ -55,12 +55,12 @@ class ArucoFSM(Node):
         self.declare_parameter('target_marker_area',    22500.0)
         self.declare_parameter('container_marker_area', 60000.0)
         self.declare_parameter('turn_gain',             30.0)
-        self.declare_parameter('forward_gain',          5.0)
+        self.declare_parameter('forward_gain',          3.75)
         self.declare_parameter('forward_speed',         10.0)
         self.declare_parameter('cx_threshold',          0.15)
         self.declare_parameter('min_turn',              7.0)
-        self.declare_parameter('grasp_distance_m',      0.20)
-        self.declare_parameter('deploy_distance_m',     0.25)
+        self.declare_parameter('grasp_distance_m',      0.15)
+        self.declare_parameter('deploy_distance_m',     0.15)
         # Startmodus: True = Distanz, False = Area
         self.declare_parameter('use_distance_target',   True)
         self.declare_parameter('use_distance_trailer',  True)
@@ -80,6 +80,8 @@ class ArucoFSM(Node):
         # Laufzeit-Modus (umschaltbar über fsm/control Topic)
         self.use_distance_target  = self.get_parameter('use_distance_target').value
         self.use_distance_trailer = self.get_parameter('use_distance_trailer').value
+
+        self.once = True
 
         # ── XGO ──────────────────────────────────────────────────────
         if XGO_AVAILABLE:
@@ -225,20 +227,35 @@ class ArucoFSM(Node):
 
     def _target_trigger(self):
         """True wenn der GRASP-Trigger für die Target-Phase ausgelöst werden soll."""
-        if self.use_distance_target and self._target_distance > 0.0:
-            return self._target_distance <= self.grasp_distance_m
-        # Fallback: area
-        return self.last_area >= self.target_area
+        if self.use_distance_target:
+            result = self._target_distance > 0.0 and self._target_distance <= self.grasp_distance_m
+            self.get_logger().info(
+                f"[FSM] _target_trigger [distance] "
+                f"dist={self._target_distance:.3f}m  threshold={self.grasp_distance_m}m  → {result}")
+            return result
+        else:
+            result = self.last_area >= self.target_area
+            self.get_logger().info(
+                f"[FSM] _target_trigger [area] "
+                f"area={self.last_area:.0f}  threshold={self.target_area:.0f}  → {result}")
+            return result
 
     def _trailer_trigger(self):
         """True wenn der DEPLOY-Trigger für die Trailer-Phase ausgelöst werden soll."""
-        if self.use_distance_trailer and self._trailer_distance > 0.0:
-            return self._trailer_distance <= self.deploy_distance_m
-        # Fallback: area
-        return self.last_area >= self.container_target_area
+        if self.use_distance_trailer:
+            result = self._trailer_distance > 0.0 and self._trailer_distance <= self.deploy_distance_m
+            self.get_logger().info(
+                f"[FSM] _trailer_trigger [distance] "
+                f"dist={self._trailer_distance:.3f}m  threshold={self.deploy_distance_m}m  → {result}")
+            return result
+        else:
+            result = self.last_area >= self.container_target_area
+            self.get_logger().info(
+                f"[FSM] _trailer_trigger [area] "
+                f"area={self.last_area:.0f}  threshold={self.container_target_area:.0f}  → {result}")
+            return result
 
     # ── Control-Loop ─────────────────────────────────────────────────
-
     def control_loop(self):
         # State publizieren
         s_msg = String(); s_msg.data = self.state.name
@@ -336,30 +353,14 @@ class ArucoFSM(Node):
                 self.state = State.APPROACH_BACK
                 return
 
-            # Trigger prüfen — nutzt Distanz oder Area je nach Modus
+            # Trigger prüfen — NUR der konfigurierte Modus (Distanz ODER Area), kein Fallback
             if not self.searching_container:
-                # Target-Phase
-                triggered = self._target_trigger()
-                dist_val  = self._target_distance
-                mode_str  = "dist" if self.use_distance_target else "area"
-                self.get_logger().info(
-                    f"[FSM] APPROACH target [{mode_str}] "
-                    f"dist={dist_val:.3f}m  area={self.last_area:.0f}  trigger={triggered}"
-                )
-                if triggered:
+                if self._target_trigger():
                     self.get_logger().info("[FSM] Target trigger reached → GRASP")
                     self.state = State.GRASP
                     return
             else:
-                # Trailer-Phase
-                triggered = self._trailer_trigger()
-                dist_val  = self._trailer_distance
-                mode_str  = "dist" if self.use_distance_trailer else "area"
-                self.get_logger().info(
-                    f"[FSM] APPROACH trailer [{mode_str}] "
-                    f"dist={dist_val:.3f}m  area={self.last_area:.0f}  trigger={triggered}"
-                )
-                if triggered:
+                if self._trailer_trigger():
                     self.get_logger().info("[FSM] Trailer trigger reached → DEPLOY")
                     self.state = State.DEPLOY
                     return
@@ -380,9 +381,6 @@ class ArucoFSM(Node):
                 self.xgo.move("x", self.forward_speed)
                 self.start_motion(duration)
                 self.state = State.APPROACH_FORWARD
-            else:
-                # area-Trigger als letzter Fallback (wenn Distanz-Modus an aber kein Signal)
-                self.state = State.DEPLOY if self.searching_container else State.GRASP
 
         elif self.state == State.APPROACH_FORWARD:
             if self.motion_done():
@@ -407,22 +405,30 @@ class ArucoFSM(Node):
                 self.start_motion(1.0)
                 self.substep = 1
             elif self.substep == 1 and self.motion_done():
-                self.xgo.arm_motor([-25, 90, 0])
+                self.xgo.move("x", 2.5)
                 self.start_motion(1.0)
                 self.substep = 2
             elif self.substep == 2 and self.motion_done():
-                self.xgo.claw(255)
-                self.start_motion(2.0)
+                self.xgo.stop()
+                self.start_motion(1.0)
                 self.substep = 3
             elif self.substep == 3 and self.motion_done():
-                self.xgo.arm_motor([20, -90, 0])
+                self.xgo.arm_motor([-25, 90, 0])
                 self.start_motion(1.0)
                 self.substep = 4
             elif self.substep == 4 and self.motion_done():
-                self.xgo.arm_motor([83, -90, 0])
-                self.start_motion(1.0)
+                self.xgo.claw(255)
+                self.start_motion(2.0)
                 self.substep = 5
             elif self.substep == 5 and self.motion_done():
+                self.xgo.arm_motor([20, -90, 0])
+                self.start_motion(1.0)
+                self.substep = 6
+            elif self.substep == 6 and self.motion_done():
+                self.xgo.arm_motor([83, -90, 0])
+                self.start_motion(1.0)
+                self.substep = 7
+            elif self.substep == 7 and self.motion_done():
                 self.substep      = 0
                 self.picked_up_id = self.last_id
                 self.last_id      = -1
@@ -469,28 +475,44 @@ class ArucoFSM(Node):
         # DEPLOY  (identisch zum Original)
         # =========================
         elif self.state == State.DEPLOY:
-            if self.substep == 0:
-                self.xgo.arm_motor([-270, 210, 0])
-                self.start_motion(1.0)
+            # if self.once:
+            #     self.xgo.translation("z", 0)
+            #     self.xgo.attitude("p", 0)
+            #     self.start_motion(2.0)
+            #     self.once = False
+
+            if self.substep == 0 and self.motion_done():
+                self.xgo.move("y", 5)
+                self.start_motion(2.0)
                 self.substep = 1
             elif self.substep == 1 and self.motion_done():
-                self.xgo.claw(0)
+                self.xgo.stop()
                 self.start_motion(1.0)
                 self.substep = 2
-            elif self.substep == 2 and self.motion_done():
-                self.xgo.arm_motor([0, -90, 0])
+            elif self.substep == 2:
+                self.xgo.arm(130, -20)
+                #self.xgo.arm_motor([-270, 210, 0])
+                #self.xgo.arm_motor([-270, 210, 0])
                 self.start_motion(1.0)
                 self.substep = 3
             elif self.substep == 3 and self.motion_done():
-                self.xgo.arm_motor([83, -90, 0])
+                self.xgo.claw(0)
                 self.start_motion(1.0)
                 self.substep = 4
             elif self.substep == 4 and self.motion_done():
+                self.xgo.arm_motor([0, -90, 0])
+                self.start_motion(1.0)
+                self.substep = 5
+            elif self.substep == 5 and self.motion_done():
+                self.xgo.arm_motor([83, -90, 0])
+                self.start_motion(1.0)
+                self.substep = 6
+            elif self.substep == 6 and self.motion_done():
                 self.xgo.translation("z", 0)
                 self.xgo.attitude("p", 0)
                 self.start_motion(2.0)
-                self.substep = 5
-            elif self.substep == 5 and self.motion_done():
+                self.substep = 7
+            elif self.substep == 7 and self.motion_done():
                 self.substep = 0
                 self.state   = State.DONE
 
