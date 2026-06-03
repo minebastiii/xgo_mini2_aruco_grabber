@@ -124,7 +124,7 @@ class ArucoFSM(Node):
             self.get_logger().warn("XGO not available — Motorbefehle unterdrückt")
 
         # ── FSM-Zustand ───────────────────────────────────────────────
-        self.state               = State.DEPLOY
+        self.state               = State.SEARCH
         self.prev_state          = None
         self.motion_active       = False
         self.substep             = 0
