@@ -174,8 +174,12 @@ class ArucoFSM(Node):
         # ── Publisher ─────────────────────────────────────────────────
         self.state_pub   = self.create_publisher(String, 'robot/state',       10)
         self.mode_pub    = self.create_publisher(String, 'fsm/control_mode',  10)
+        self.battery_pub = self.create_publisher(Float32, 'robot/battery',    10)
 
         self.timer = self.create_timer(0.1, self.control_loop)
+        # Read battery every 10 s — separate timer so control_loop timing is unaffected
+        self.create_timer(10.0, self._pub_battery)
+        self._pub_battery()   # also read once immediately on startup
 
     # ── Callbacks ────────────────────────────────────────────────────
 
@@ -282,6 +286,22 @@ class ArucoFSM(Node):
                 f"[FSM] _trailer_trigger [area] "
                 f"area={self.last_area:.0f}  threshold={self.container_target_area:.0f}  → {result}")
             return result
+
+    # ── Battery ───────────────────────────────────────────────────────
+    def _pub_battery(self):
+        if self.xgo is None:
+            return
+        try:
+            level = self.xgo.read_battery()   # returns 0-100 (int)
+            msg = Float32()
+            msg.data = float(level)
+            self.battery_pub.publish(msg)
+            if level <= 20:
+                self.get_logger().warn(f"[FSM] Battery LOW: {level}%")
+            else:
+                self.get_logger().debug(f"[FSM] Battery: {level}%")
+        except Exception as e:
+            self.get_logger().warn(f"[FSM] Battery read failed: {e}")
 
     # ── Control-Loop ─────────────────────────────────────────────────
     def control_loop(self):
@@ -594,7 +614,24 @@ class ArucoFSM(Node):
         # DONE  (identisch zum Original)
         # =========================
         elif self.state == State.DONE:
-            self.xgo.action(15)
+            #self.xgo.action(15)
+            if self.substep == 0 and self.motion_done():
+                self.xgo.move("x", -10)
+                self.start_motion(3.5)
+                self.substep = 1
+                pass
+            elif self.substep == 1 and self.motion_done():
+                self.xgo.stop()
+                self.start_motion(1.0)
+                self.state               = State.SEARCH
+                self.prev_state          = None
+                self.motion_active       = False
+                self.substep             = 0
+                self.searching_container = False
+                self.picked_up_id        = -1
+                self.get_logger().info("[FSM] Restarted FSM")
+                self.substep = 0
+                pass
 
 
 def main(args=None):
