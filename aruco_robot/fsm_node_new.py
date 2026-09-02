@@ -461,21 +461,17 @@ class ArucoFSM(Node):
         # VERIFY
         elif self.state == State.VERIFY:
             if self.substep == 0:
-                self.xgo.stop()
-                self.start_motion(3.0)
-                self.substep = 1
-            elif self.substep == 1 and self.motion_done():
                 self.xgo.translation("z", 80)
                 self.xgo.attitude("p", 15)
                 self.start_motion(1.0)
-                self.substep = 2
-            elif self.substep == 2 and self.motion_done():
+                self.substep = 1
+            elif self.substep == 1 and self.motion_done():
                 self.xgo.move("x", -self.forward_speed)
                 self.start_motion(1.0)
                 self.substep = 3
             elif self.substep == 3 and self.motion_done():
                 self.xgo.stop()
-                self.start_motion(3.0)
+                self.start_motion(1.0)
                 self.substep = 4
             elif self.substep == 4 and self.motion_done():
                 verified = True if self.last_id == -1 else False
