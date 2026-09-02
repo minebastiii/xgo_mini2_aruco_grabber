@@ -1,0 +1,15 @@
+targets:
+  cube:
+    ids: [0]
+    dict: "4x4_50"
+    marker_size_m: 0.019
+
+trailers:
+  container:
+    ids: [8]   # kleiner Marker (Nahfeld, primär)
+    dict: "4x4_50"
+    marker_size_m: 0.019
+    far_ids: [1]          # großer Marker (Fernfeld, Fallback)
+    far_dict: "4x4_50"
+    far_marker_size_m: 0.10
+
