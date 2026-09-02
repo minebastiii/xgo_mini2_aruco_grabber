@@ -319,7 +319,7 @@ class ArucoFSM(Node):
 
             if abs(cx_error) > self.cx_threshold:
                 if cx_error > 0:
-                    turn   = min((-self.turn_gain * cx_error + 20.0), -(self.min_turn + 20.0))
+                    turn   = min((-self.turn_gain * cx_error), -(self.min_turn))
                     strave = min((-self.strave_gain * cx_error), -(self.min_strave))
                 else:
                     turn   = max((-self.turn_gain * cx_error), self.min_turn)
@@ -473,7 +473,7 @@ class ArucoFSM(Node):
                 self.xgo.move("x", -self.forward_speed)
                 self.start_motion(1.0)
                 self.substep = 3
-            elif self.substep == 3:
+            elif self.substep == 3 and self.motion_done():
                 self.xgo.stop()
                 self.start_motion(3.0)
                 self.substep = 4
@@ -507,7 +507,7 @@ class ArucoFSM(Node):
                 self.xgo.stop()
                 self.start_motion(1.0)
                 self.substep = 2
-            if self.substep == 2 and self.motion_done():
+            elif self.substep == 2 and self.motion_done():
                 self.xgo.move("x", 5)
                 self.start_motion(1.5)
                 self.substep = 3
@@ -515,7 +515,7 @@ class ArucoFSM(Node):
                 self.xgo.stop()
                 self.start_motion(1.0)
                 self.substep = 4
-            elif self.substep == 4:
+            elif self.substep == 4 and self.motion_done():
                 self.xgo.arm(130, -20)
                 self.start_motion(1.0)
                 self.substep = 5
@@ -524,14 +524,10 @@ class ArucoFSM(Node):
                 self.start_motion(1.0)
                 self.substep = 6
             elif self.substep == 6 and self.motion_done():
-                self.xgo.arm_motor([0, -90, 0])
+                self.xgo.reset()
                 self.start_motion(1.0)
                 self.substep = 7
             elif self.substep == 7 and self.motion_done():
-                self.xgo.arm_motor([83, -90, 0])
-                self.start_motion(1.0)
-                self.substep = 8
-            elif self.substep == 8 and self.motion_done():
                 self.xgo.translation("z", 0)
                 self.xgo.attitude("p", 0)
                 self.start_motion(2.0)
@@ -557,15 +553,13 @@ class ArucoFSM(Node):
                 self.substep = 3
             elif self.substep == 3 and self.motion_done():
                 self.xgo.stop()
-                self.start_motion(1.0)
                 self.state               = State.SEARCH
                 self.prev_state          = None
                 self.motion_active       = False
-                self.substep             = 0
                 self.searching_container = False
                 self.picked_up_id        = -1
+                self.substep             = 0
                 self.get_logger().info("[FSM] Restarted FSM")
-                self.substep = 0
 
 
 def main(args=None):
