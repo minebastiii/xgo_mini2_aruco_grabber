@@ -94,7 +94,7 @@ sudo systemctl restart aruco-robot.service
 For manual start:
 
 ```bash
-ros2 launch aruco_robot robot.launch.py
+ros2 launch aruco_robot robot_new.launch.py
 ```
 
 See `CHEATSHEET.md` for marker/config setup and launch arguments.
