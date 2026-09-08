@@ -1,0 +1,31 @@
+[Unit]
+Description=ArUco Robot (ROS 2 FSM + XGO)
+# Warten bis Netzwerk da ist (wichtig für Zenoh/DDS zwischen Laptop und Robot)
+After=network.target
+# Automatisch neustarten wenn der Prozess crasht
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+
+User=pi
+# Pfad zum Wrapper-Script (muss mit dem User-Home übereinstimmen)
+ExecStart=/home/pi/start_aruco_robot.sh
+
+# Sauberes Beenden: erst SIGINT (Ctrl+C) damit ROS nodes sich ordentlich beenden
+# dann nach 10s SIGKILL falls nötig
+KillSignal=SIGINT
+TimeoutStopSec=10
+
+# Bei Crash automatisch neustarten (5s Pause)
+Restart=on-failure
+RestartSec=5s
+
+# Logging: journalctl -u aruco-robot -f
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=aruco-robot
+
+[Install]
+WantedBy=multi-user.target
