@@ -74,6 +74,16 @@ Runs on a Raspberry Pi on the robot, ROS2, with:
 - `numpy`, `pyyaml`
 - `xgolib` (XGO SDK — optional at import time; if missing, motor commands are suppressed and a warning is logged instead of crashing)
 
+## Install
+
+After installing the required packages and compiling the workspace there is one more step to do for the auto start feature. To do so you have to put the aruco-robot.service file in /etc/systemd/system and the start_aruco_robot.sh script in the home directory /home/pi. Both can be found in the setup directory in this repository.
+
+Then run:
+
+```bash
+sudo systemctl enable aruco-robot.service
+```
+
 ## Running it
 
 The launch file is startet automatically, via a service, after turning on the robot. If you run multiple robots at the same time don't forget to change the ROS_DOMAIN_ID for each robot.
