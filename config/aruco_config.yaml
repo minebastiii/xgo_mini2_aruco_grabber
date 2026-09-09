@@ -6,10 +6,10 @@ targets:
 
 trailers:
   container:
-    ids: [8]   # kleiner Marker (Nahfeld, primär)
+    ids: [8]
     dict: "4x4_50"
     marker_size_m: 0.019
-    far_ids: [1]          # großer Marker (Fernfeld, Fallback)
+    far_ids: [1]
     far_dict: "4x4_50"
     far_marker_size_m: 0.10
 

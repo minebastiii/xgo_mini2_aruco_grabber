@@ -12,4 +12,4 @@ fi
 
 export ROS_DOMAIN_ID=34
 
-exec ros2 launch aruco_robot robot_new.launch.py
+exec ros2 launch aruco_robot robot.launch.py
