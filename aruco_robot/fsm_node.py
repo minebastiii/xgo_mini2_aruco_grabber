@@ -285,6 +285,8 @@ class ArucoFSM(Node):
         if self.state == State.SEARCH:
             if self.last_found:
                 self.state = State.ALIGN
+                self.PICKING_UP_ID = self.last_id
+                self.get_logger().info(f"PICKING_UP_ID: {self.PICKING_UP_ID}")
                 return
             self.xgo.turn(25)
             self.start_motion(2.0)
@@ -465,7 +467,8 @@ class ArucoFSM(Node):
                 self.start_motion(1.0)
                 self.substep = 4
             elif self.substep == 4 and self.motion_done():
-                verified = True if self.last_id == -1 else False
+                self.get_logger().info(f"LAST_ID: {self.last_id}, PICKING_UP_ID: {self.PICKING_UP_ID}")
+                verified = True if self.last_id != self.PICKING_UP_ID else False
                 self.get_logger().info(f"Verified : {verified}")
                 self.substep = 0
                 if verified:
@@ -486,8 +489,16 @@ class ArucoFSM(Node):
 
         # DEPLOY
         elif self.state == State.DEPLOY:
+            # if self.substep == 0 and self.motion_done():
+            #     self.xgo.move("y", 5)
+            #     self.start_motion(1.5)
+            #     self.substep = 1
+            # elif self.substep == 1 and self.motion_done():
+            #     self.xgo.stop()
+            #     self.start_motion(1.0)
+            #     self.substep = 2
             if self.substep == 0 and self.motion_done():
-                self.xgo.move("y", 5)
+                self.xgo.move("x", 5)
                 self.start_motion(1.5)
                 self.substep = 1
             elif self.substep == 1 and self.motion_done():
@@ -495,31 +506,23 @@ class ArucoFSM(Node):
                 self.start_motion(1.0)
                 self.substep = 2
             elif self.substep == 2 and self.motion_done():
-                self.xgo.move("x", 5)
-                self.start_motion(1.5)
+                self.xgo.arm(130, -20)
+                self.start_motion(1.0)
                 self.substep = 3
             elif self.substep == 3 and self.motion_done():
-                self.xgo.stop()
+                self.xgo.claw(0)
                 self.start_motion(1.0)
                 self.substep = 4
             elif self.substep == 4 and self.motion_done():
-                self.xgo.arm(130, -20)
+                self.xgo.reset()
                 self.start_motion(1.0)
                 self.substep = 5
             elif self.substep == 5 and self.motion_done():
-                self.xgo.claw(0)
-                self.start_motion(1.0)
-                self.substep = 6
-            elif self.substep == 6 and self.motion_done():
-                self.xgo.reset()
-                self.start_motion(1.0)
-                self.substep = 7
-            elif self.substep == 7 and self.motion_done():
                 self.xgo.translation("z", 0)
                 self.xgo.attitude("p", 0)
                 self.start_motion(2.0)
-                self.substep = 9
-            elif self.substep == 9 and self.motion_done():
+                self.substep = 6
+            elif self.substep == 6 and self.motion_done():
                 self.substep = 0
                 self.state   = State.DONE
 
