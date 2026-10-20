@@ -11,9 +11,19 @@ ID lock:
     GRASP and VERIFY only react to that ID; other targets are ignored.
   * After a successful VERIFY the FSM locks the first trailer it sees
     (by group name, so near and far IDs of the same trailer both count).
-  * Both locks are released only after DEPLOY has completed (DONE.3),
+  * Both locks are released only after DEPLOY has been verified (DONE),
     by the optional lock_timeout_s, or by {"release_lock": true} on
     fsm/control.
+
+VERIFY runs twice per cycle (verify_phase), both times with the same
+movement: camera pose down (z=80, pitch=15), step back, stop, check.
+  * after GRASP:  locked target no longer visible → carry it, search trailer
+                  still visible                   → retry from SEARCH
+  * after DEPLOY: locked target no longer visible → DONE (step back,
+                                                    release locks, restart)
+                  still visible (fell next to the trailer)
+                                                  → back to target mode,
+                                                    ALIGN on the same ID
 """
 
 import json
@@ -101,7 +111,7 @@ class ArucoFSM(Node):
         self.motion_active       = False
         self.substep             = 0
         self.searching_container = False
-        self.get_logger().info("[FSM] Starting new FSM")
+        self.get_logger().info("[FSM] Starting new FSM (build: lock + deploy-verify)")
 
         # ── Marker list + lock ────────────────────────────────────────
         self.markers          = []      # latest list from camera_node
@@ -111,6 +121,7 @@ class ArucoFSM(Node):
         self.last_seen_locked = None    # time the locked marker was last seen
         self.tracked          = None    # current entry of the locked marker
         self._verify_t0       = None
+        self.verify_phase     = "grasp"  # "grasp" | "deploy"
 
         # Values of the tracked marker used by ALIGN / APPROACH
         self.last_cx   = 0.0
@@ -498,8 +509,11 @@ class ArucoFSM(Node):
                 self.start_motion(1.0)
                 self.substep = 6
             elif self.substep == 6 and self.motion_done():
-                self.substep = 0
-                self.state   = State.VERIFY
+                self.get_logger().info(
+                    f"[FSM] Grasp of id {self.locked_target_id} finished → VERIFY (grasp)")
+                self.substep      = 0
+                self.verify_phase = "grasp"
+                self.state        = State.VERIFY
 
         # VERIFY
         elif self.state == State.VERIFY:
@@ -527,10 +541,27 @@ class ArucoFSM(Node):
                 )
                 verified = not still_visible
                 self.get_logger().info(
-                    f"[FSM] Verify id {self.locked_target_id}: still visible={still_visible} "
-                    f"→ verified={verified}")
+                    f"[FSM] Verify ({self.verify_phase}) id {self.locked_target_id}: "
+                    f"still visible={still_visible} → verified={verified}")
                 self.substep = 0
                 self.forward_speed = self.get_parameter('forward_speed').value
+
+                if self.verify_phase == "deploy":
+                    if verified:
+                        # Object is in the trailer → finish as usual.
+                        self.get_logger().info(
+                            f"[FSM] Deploy verified, id {self.locked_target_id} gone → DONE")
+                        self.state = State.DONE
+                    else:
+                        # Object lies next to the trailer → pick it up again.
+                        self.get_logger().warn(
+                            f"[FSM] Deploy failed, id {self.locked_target_id} still visible → ALIGN")
+                        self.searching_container = False
+                        self.locked_trailer      = None
+                        self._update_tracked()
+                        self.state = State.ALIGN
+                    return
+
                 if verified:
                     self.xgo.translation("z", 100)
                     self.xgo.attitude("p", 0)
@@ -576,8 +607,11 @@ class ArucoFSM(Node):
                 self.start_motion(2.0)
                 self.substep = 6
             elif self.substep == 6 and self.motion_done():
-                self.substep = 0
-                self.state   = State.DONE
+                self.get_logger().info(
+                    f"[FSM] Deploy of id {self.locked_target_id} finished → VERIFY (deploy)")
+                self.substep      = 0
+                self.verify_phase = "deploy"
+                self.state        = State.VERIFY
 
         # DONE
         elif self.state == State.DONE:
