@@ -1,10 +1,26 @@
 #!/usr/bin/env python3
+"""
+aruco_fsm — pick-and-place FSM for the XGO.
+
+Input: aruco/markers (String/JSON) from camera_node — list of all
+visible target/trailer markers, sorted by area (largest first).
+
+ID lock:
+  * In SEARCH (target phase) the FSM locks the first target marker it
+    sees (= largest/closest in the frame). From then on ALIGN, APPROACH,
+    GRASP and VERIFY only react to that ID; other targets are ignored.
+  * After a successful VERIFY the FSM locks the first trailer it sees
+    (by group name, so near and far IDs of the same trailer both count).
+  * Both locks are released only after DEPLOY has completed (DONE.3),
+    by the optional lock_timeout_s, or by {"release_lock": true} on
+    fsm/control.
+"""
 
 import json
 import rclpy
 from rclpy.node import Node
 from rclpy.duration import Duration
-from std_msgs.msg import Float32MultiArray, Float32, String
+from std_msgs.msg import Float32, String
 from enum import Enum, auto
 
 try:
@@ -48,6 +64,9 @@ class ArucoFSM(Node):
         self.declare_parameter('approach_dist_gain', 10.0)   # s/m
         self.declare_parameter('approach_step_min',  1.0)    # s
         self.declare_parameter('approach_step_max',  3.0)    # s
+        # Release the target lock if the locked ID has not been seen for
+        # this long while still searching for it (0 = never release).
+        self.declare_parameter('lock_timeout_s',     0.0)
 
         self.target_area           = self.get_parameter('target_marker_area').value
         self.container_target_area = self.get_parameter('container_marker_area').value
@@ -63,11 +82,10 @@ class ArucoFSM(Node):
         self.approach_dist_gain    = self.get_parameter('approach_dist_gain').value
         self.approach_step_min     = self.get_parameter('approach_step_min').value
         self.approach_step_max     = self.get_parameter('approach_step_max').value
+        self.lock_timeout_s        = self.get_parameter('lock_timeout_s').value
 
         self.use_distance_target  = self.get_parameter('use_distance_target').value
         self.use_distance_trailer = self.get_parameter('use_distance_trailer').value
-
-        self.once = True
 
         if XGO_AVAILABLE:
             self.xgo = XGO(port='/dev/ttyAMA0')
@@ -83,46 +101,26 @@ class ArucoFSM(Node):
         self.motion_active       = False
         self.substep             = 0
         self.searching_container = False
-        self.picked_up_id        = -1
         self.get_logger().info("[FSM] Starting new FSM")
 
-        self.last_found = False
-        self.last_cx    = 0.0
-        self.last_cy    = 0.0
-        self.last_area  = 0.0
-        self.last_id    = -1
+        # ── Marker list + lock ────────────────────────────────────────
+        self.markers          = []      # latest list from camera_node
+        self.markers_rx       = None    # receive time of that list
+        self.locked_target_id = None    # int, locked in SEARCH
+        self.locked_trailer   = None    # trailer group name, locked in SEARCH
+        self.last_seen_locked = None    # time the locked marker was last seen
+        self.tracked          = None    # current entry of the locked marker
+        self._verify_t0       = None
 
-        self._target_cx      = 0.0
-        self._target_cy      = 0.0
-        self._target_area    = 0.0
-        self._target_id      = -1
-        self._target_cx_f    = 0.0
-        self._target_area_f  = 0.0
-        self._trailer_cx     = 0.0
-        self._trailer_cy     = 0.0
-        self._trailer_area   = 0.0
-        self._trailer_id     = -1
-        self._trailer_cx_f   = 0.0
-        self._trailer_area_f = 0.0
-        self._target_distance  = -1.0
-        self._trailer_distance = -1.0
+        # Values of the tracked marker used by ALIGN / APPROACH
+        self.last_cx   = 0.0
+        self.last_area = 0.0
+        self.last_dist = -1.0
 
-        # ── Subscriptions — now fed by camera_node.py on the robot ─────
-        self.create_subscription(Float32MultiArray, 'aruco/target/data',
-                                 self._cb_target_data, 10)
-        self.create_subscription(Float32MultiArray, 'aruco/target/data_filtered',
-                                 self._cb_target_filt, 10)
-        self.create_subscription(Float32MultiArray, 'aruco/trailer/data',
-                                 self._cb_trailer_data, 10)
-        self.create_subscription(Float32MultiArray, 'aruco/trailer/data_filtered',
-                                 self._cb_trailer_filt, 10)
-        self.create_subscription(Float32, 'aruco/target/distance',
-                                 self._cb_target_distance, 10)
-        self.create_subscription(Float32, 'aruco/trailer/distance',
-                                 self._cb_trailer_distance, 10)
+        # ── Subscriptions ─────────────────────────────────────────────
+        self.create_subscription(String, 'aruco/markers', self._cb_markers, 10)
         # Dashboard (laptop) → FSM: switch mode.
-        self.create_subscription(String, 'fsm/control',
-                                 self._cb_control, 10)
+        self.create_subscription(String, 'fsm/control', self._cb_control, 10)
 
         self.state_pub   = self.create_publisher(String, 'robot/state',       10)
         self.mode_pub    = self.create_publisher(String, 'fsm/control_mode',  10)
@@ -134,40 +132,15 @@ class ArucoFSM(Node):
 
     # ── Callbacks ────────────────────────────────────────────────────
 
-    def _cb_target_data(self, msg: Float32MultiArray):
-        self._target_cx, self._target_cy, self._target_area, id_ = msg.data
-        self._target_id = int(id_)
-        if not self.searching_container:
-            self.last_cx    = self._target_cx
-            self.last_cy    = self._target_cy
-            self.last_area  = self._target_area
-            self.last_id    = self._target_id
-            self.last_found = self.last_id != -1
-
-    def _cb_target_filt(self, msg: Float32MultiArray):
-        self._target_cx_f, _, self._target_area_f, _ = msg.data
-        if not self.searching_container:
-            self.last_cx   = self._target_cx_f
-            self.last_area = self._target_area_f
-
-    def _cb_trailer_data(self, msg: Float32MultiArray):
-        self._trailer_cx, self._trailer_cy, self._trailer_area, id_ = msg.data
-        self._trailer_id = int(id_)
-        if self.searching_container:
-            self.last_cx    = self._trailer_cx
-            self.last_cy    = self._trailer_cy
-            self.last_area  = self._trailer_area
-            self.last_id    = self._trailer_id
-            self.last_found = self.last_id != -1
-
-    def _cb_trailer_filt(self, msg: Float32MultiArray):
-        self._trailer_cx_f, _, self._trailer_area_f, _ = msg.data
-        if self.searching_container:
-            self.last_cx   = self._trailer_cx_f
-            self.last_area = self._trailer_area_f
-
-    def _cb_target_distance(self,  msg: Float32): self._target_distance  = float(msg.data)
-    def _cb_trailer_distance(self, msg: Float32): self._trailer_distance = float(msg.data)
+    def _cb_markers(self, msg: String):
+        try:
+            payload = json.loads(msg.data)
+        except Exception as e:
+            self.get_logger().error(f"[FSM] markers parse error: {e}")
+            return
+        self.markers    = payload.get("markers", [])
+        self.markers_rx = self.get_clock().now()
+        self._update_tracked()
 
     def _cb_control(self, msg: String):
         try:
@@ -191,8 +164,82 @@ class ArucoFSM(Node):
                 self.approach_step_min = float(cmd["approach_step_min"])
             if "approach_step_max" in cmd:
                 self.approach_step_max = float(cmd["approach_step_max"])
+            if "lock_timeout_s" in cmd:
+                self.lock_timeout_s = float(cmd["lock_timeout_s"])
+            if cmd.get("release_lock"):
+                self.get_logger().info("[FSM] Lock released via fsm/control")
+                self._release_locks()
         except Exception as e:
             self.get_logger().error(f"[FSM] control parse error: {e}")
+
+    # ── Lock helpers ──────────────────────────────────────────────────
+
+    def _visible(self, kind, include_persisted=True):
+        return [m for m in self.markers
+                if m.get("kind") == kind and (include_persisted or not m.get("persisted"))]
+
+    def _update_tracked(self):
+        """Pick the entry of the locked marker from the current list."""
+        if self.searching_container:
+            cands = [m for m in self._visible("trailer")
+                     if self.locked_trailer is not None and m.get("name") == self.locked_trailer]
+            # Prefer the near marker over the far fallback, then the largest.
+            cands.sort(key=lambda m: (bool(m.get("far")), -float(m.get("area", 0.0))))
+        else:
+            cands = [m for m in self._visible("target")
+                     if self.locked_target_id is not None and int(m.get("id", -1)) == self.locked_target_id]
+
+        self.tracked = cands[0] if cands else None
+        if self.tracked is not None:
+            self.last_seen_locked = self.get_clock().now()
+            self.last_cx   = float(self.tracked.get("cx_f", self.tracked.get("cx", 0.0)))
+            self.last_area = float(self.tracked.get("area_f", self.tracked.get("area", 0.0)))
+            self.last_dist = float(self.tracked.get("dist", -1.0))
+        else:
+            self.last_dist = -1.0
+
+    def _try_lock(self):
+        """Lock the first marker of the active kind if nothing is locked yet."""
+        if self.searching_container:
+            if self.locked_trailer is None:
+                trailers = self._visible("trailer", include_persisted=False)
+                if trailers:
+                    self.locked_trailer   = trailers[0]["name"]
+                    self.last_seen_locked = self.get_clock().now()
+                    self.get_logger().info(f"[FSM] Locked trailer '{self.locked_trailer}'")
+        else:
+            if self.locked_target_id is None:
+                targets = self._visible("target", include_persisted=False)
+                if targets:
+                    self.locked_target_id = int(targets[0]["id"])
+                    self.last_seen_locked = self.get_clock().now()
+                    self.get_logger().info(
+                        f"[FSM] Locked target id {self.locked_target_id} ('{targets[0]['name']}')")
+        self._update_tracked()
+
+    def _release_locks(self):
+        self.locked_target_id = None
+        self.locked_trailer   = None
+        self.last_seen_locked = None
+        self.tracked          = None
+        self.last_dist        = -1.0
+
+    def _marker_found(self):
+        return self.tracked is not None
+
+    def _check_lock_timeout(self):
+        """Only while still looking for the target, never while carrying it."""
+        if self.lock_timeout_s <= 0.0 or self.searching_container:
+            return
+        if self.locked_target_id is None or self.last_seen_locked is None:
+            return
+        if self.state in (State.GRASP, State.VERIFY, State.DEPLOY, State.DONE):
+            return
+        age = (self.get_clock().now() - self.last_seen_locked).nanoseconds * 1e-9
+        if age > self.lock_timeout_s:
+            self.get_logger().warn(
+                f"[FSM] Target id {self.locked_target_id} not seen for {age:.1f}s → lock released")
+            self._release_locks()
 
     # ── Motion helpers ────────────────────────────────────────────────
 
@@ -212,29 +259,29 @@ class ArucoFSM(Node):
 
     def _target_trigger(self):
         if self.use_distance_target:
-            result = self._target_distance > 0.0 and self._target_distance <= self.grasp_distance_m
+            result = self.last_dist > 0.0 and self.last_dist <= self.grasp_distance_m
             self.get_logger().info(
-                f"[FSM] _target_trigger [distance] "
-                f"dist={self._target_distance:.3f}m  threshold={self.grasp_distance_m}m  → {result}")
+                f"[FSM] _target_trigger [distance] id={self.locked_target_id} "
+                f"dist={self.last_dist:.3f}m  threshold={self.grasp_distance_m}m  → {result}")
             return result
         else:
             result = self.last_area >= self.target_area
             self.get_logger().info(
-                f"[FSM] _target_trigger [area] "
+                f"[FSM] _target_trigger [area] id={self.locked_target_id} "
                 f"area={self.last_area:.0f}  threshold={self.target_area:.0f}  → {result}")
             return result
 
     def _trailer_trigger(self):
         if self.use_distance_trailer:
-            result = self._trailer_distance > 0.0 and self._trailer_distance <= self.deploy_distance_m
+            result = self.last_dist > 0.0 and self.last_dist <= self.deploy_distance_m
             self.get_logger().info(
-                f"[FSM] _trailer_trigger [distance] "
-                f"dist={self._trailer_distance:.3f}m  threshold={self.deploy_distance_m}m  → {result}")
+                f"[FSM] _trailer_trigger [distance] trailer={self.locked_trailer} "
+                f"dist={self.last_dist:.3f}m  threshold={self.deploy_distance_m}m  → {result}")
             return result
         else:
             result = self.last_area >= self.container_target_area
             self.get_logger().info(
-                f"[FSM] _trailer_trigger [area] "
+                f"[FSM] _trailer_trigger [area] trailer={self.locked_trailer} "
                 f"area={self.last_area:.0f}  threshold={self.container_target_area:.0f}  → {result}")
             return result
 
@@ -264,11 +311,15 @@ class ArucoFSM(Node):
             "use_distance_trailer": self.use_distance_trailer,
             "grasp_distance_m":     self.grasp_distance_m,
             "deploy_distance_m":    self.deploy_distance_m,
-            "target_distance":      self._target_distance,
-            "trailer_distance":     self._trailer_distance,
+            "target_distance":      self.last_dist if not self.searching_container else -1.0,
+            "trailer_distance":     self.last_dist if self.searching_container else -1.0,
             "approach_dist_gain":   self.approach_dist_gain,
             "approach_step_min":    self.approach_step_min,
             "approach_step_max":    self.approach_step_max,
+            "lock_timeout_s":       self.lock_timeout_s,
+            "locked_target_id":     self.locked_target_id,
+            "locked_trailer":       self.locked_trailer,
+            "searching_container":  self.searching_container,
         }
         m_msg = String(); m_msg.data = json.dumps(mode)
         self.mode_pub.publish(m_msg)
@@ -281,12 +332,13 @@ class ArucoFSM(Node):
             self.get_logger().info(f"[FSM] {self.prev_state} → {self.state}")
             self.prev_state = self.state
 
+        self._check_lock_timeout()
+
         # SEARCH
         if self.state == State.SEARCH:
-            if self.last_found:
+            self._try_lock()
+            if self._marker_found():
                 self.state = State.ALIGN
-                self.PICKING_UP_ID = self.last_id
-                self.get_logger().info(f"PICKING_UP_ID: {self.PICKING_UP_ID}")
                 return
             self.xgo.turn(25)
             self.start_motion(2.0)
@@ -304,7 +356,7 @@ class ArucoFSM(Node):
 
         # ALIGN
         elif self.state == State.ALIGN:
-            if not self.last_found:
+            if not self._marker_found():
                 self.state = State.SEARCH
                 return
 
@@ -343,7 +395,7 @@ class ArucoFSM(Node):
 
         # APPROACH
         elif self.state == State.APPROACH:
-            if not self.last_found:
+            if not self._marker_found():
                 self.xgo.move("x", -self.forward_speed)
                 self.start_motion(1.0)
                 self.state = State.APPROACH_BACK
@@ -351,27 +403,27 @@ class ArucoFSM(Node):
 
             if not self.searching_container:
                 if self._target_trigger():
-                    self.get_logger().info("[FSM] Target trigger reached → GRASP")
+                    self.get_logger().info(
+                        f"[FSM] Target trigger reached (id {self.locked_target_id}) → GRASP")
                     self.state = State.GRASP
                     return
             else:
                 if self._trailer_trigger():
-                    self.get_logger().info("[FSM] Trailer trigger reached → DEPLOY")
+                    self.get_logger().info(
+                        f"[FSM] Trailer trigger reached ('{self.locked_trailer}') → DEPLOY")
                     self.state = State.DEPLOY
                     return
 
             if not self.searching_container:
                 use_dist = self.use_distance_target
-                dist_val = self._target_distance
                 thresh   = self.grasp_distance_m
-                area_val = self.last_area
                 area_tgt = self.target_area
             else:
                 use_dist = self.use_distance_trailer
-                dist_val = self._trailer_distance
                 thresh   = self.deploy_distance_m
-                area_val = self.last_area
                 area_tgt = self.container_target_area
+            dist_val = self.last_dist
+            area_val = self.last_area
 
             if use_dist:
                 if dist_val > 0:
@@ -421,7 +473,7 @@ class ArucoFSM(Node):
 
         # GRASP
         elif self.state == State.GRASP:
-            if self.substep == 0:
+            if self.substep == 0 and self.motion_done():
                 self.xgo.claw(0)
                 self.start_motion(1.0)
                 self.substep = 1
@@ -446,14 +498,12 @@ class ArucoFSM(Node):
                 self.start_motion(1.0)
                 self.substep = 6
             elif self.substep == 6 and self.motion_done():
-                self.substep      = 0
-                self.picked_up_id = self.last_id
-                self.last_id      = -1
-                self.state        = State.VERIFY
+                self.substep = 0
+                self.state   = State.VERIFY
 
         # VERIFY
         elif self.state == State.VERIFY:
-            if self.substep == 0:
+            if self.substep == 0 and self.motion_done():
                 self.xgo.translation("z", 80)
                 self.xgo.attitude("p", 15)
                 self.start_motion(1.0)
@@ -461,42 +511,45 @@ class ArucoFSM(Node):
             elif self.substep == 1 and self.motion_done():
                 self.xgo.move("x", -self.forward_speed)
                 self.start_motion(1.0)
-                self.substep = 3
-            elif self.substep == 3 and self.motion_done():
+                self.substep = 2
+            elif self.substep == 2 and self.motion_done():
                 self.xgo.stop()
                 self.start_motion(1.0)
-                self.substep = 4
-            elif self.substep == 4 and self.motion_done():
-                self.get_logger().info(f"LAST_ID: {self.last_id}, PICKING_UP_ID: {self.PICKING_UP_ID}")
-                verified = True if self.last_id != self.PICKING_UP_ID else False
-                self.get_logger().info(f"Verified : {verified}")
+                # Only marker lists received after the robot stopped count.
+                self._verify_t0 = self.get_clock().now()
+                self.substep = 3
+            elif self.substep == 3 and self.motion_done():
+                if self.markers_rx is None or self.markers_rx <= self._verify_t0:
+                    return  # wait for a fresh marker list
+                still_visible = any(
+                    int(m.get("id", -1)) == self.locked_target_id
+                    for m in self._visible("target", include_persisted=False)
+                )
+                verified = not still_visible
+                self.get_logger().info(
+                    f"[FSM] Verify id {self.locked_target_id}: still visible={still_visible} "
+                    f"→ verified={verified}")
                 self.substep = 0
+                self.forward_speed = self.get_parameter('forward_speed').value
                 if verified:
                     self.xgo.translation("z", 100)
                     self.xgo.attitude("p", 0)
                     self.start_motion(2.0)
-                    self.forward_speed       = self.get_parameter('forward_speed').value
-                    self.last_found          = False
+                    # Keep the target lock (we carry it); trailer gets locked in SEARCH.
                     self.searching_container = True
+                    self.locked_trailer      = None
+                    self._update_tracked()
                     self.state               = State.SEARCH
                 else:
+                    # Retry the same locked ID.
                     self.xgo.translation("z", 80)
                     self.xgo.attitude("p", 15)
                     self.start_motion(2.0)
-                    self.last_found    = False
-                    self.forward_speed = self.get_parameter('forward_speed').value
-                    self.state         = State.SEARCH
+                    self._update_tracked()
+                    self.state = State.SEARCH
 
         # DEPLOY
         elif self.state == State.DEPLOY:
-            # if self.substep == 0 and self.motion_done():
-            #     self.xgo.move("y", 5)
-            #     self.start_motion(1.5)
-            #     self.substep = 1
-            # elif self.substep == 1 and self.motion_done():
-            #     self.xgo.stop()
-            #     self.start_motion(1.0)
-            #     self.substep = 2
             if self.substep == 0 and self.motion_done():
                 self.xgo.move("x", 5)
                 self.start_motion(1.5)
@@ -543,11 +596,13 @@ class ArucoFSM(Node):
                 self.substep = 3
             elif self.substep == 3 and self.motion_done():
                 self.xgo.stop()
+                self.get_logger().info(
+                    f"[FSM] Deploy of id {self.locked_target_id} complete → releasing locks")
+                self._release_locks()
                 self.state               = State.SEARCH
                 self.prev_state          = None
                 self.motion_active       = False
                 self.searching_container = False
-                self.picked_up_id        = -1
                 self.substep             = 0
                 self.get_logger().info("[FSM] Restarted FSM")
 

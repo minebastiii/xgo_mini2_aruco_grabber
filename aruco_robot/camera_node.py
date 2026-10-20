@@ -2,27 +2,46 @@
 """
 camera_node.py — runs on the ROBOT (Pi)
 
-Trimmed down: this node computes ONLY what the FSM needs — marker
-detection, pose/distance, temporal persistence, EMA filtering — and
-publishes the plain camera feed. It does NOT compute any debug
-visuals (masks, ROI boxes, zoomed crops, overlays) any more; that is
-now done entirely on the laptop dashboard from the raw image.
+Computes only what the FSM needs — marker detection, pose/distance,
+temporal persistence, EMA filtering — and publishes the plain camera
+feed. Debug visuals are built on the laptop dashboard from the raw image.
 
-Published topics (unchanged names, so fsm_node needs no changes):
-  camera/compressed, camera/image_raw (optional)  -> also consumed by
-                                                      the laptop dashboard
-                                                      to build debug views
+Main output:
+  aruco/markers  (String/JSON) — list of ALL configured markers visible
+                                 in the current frame, sorted by area
+                                 (largest / closest first). Published
+                                 every frame, also when empty, so
+                                 "nothing visible" is explicit.
+
+    {
+      "stamp": <float, seconds>,
+      "markers": [
+        {
+          "kind":  "target" | "trailer",
+          "name":  <config group name>,
+          "id":    <int marker id>,
+          "dict":  <aruco dict name>,
+          "far":   <bool, matched via trailer far_ids>,
+          "cx", "cy", "area":       raw pixel values,
+          "cx_f", "cy_f", "area_f": EMA-filtered (per marker),
+          "dist":  <float m, -1 if unknown>,
+          "persisted": <bool, held over from a recent frame>
+        }, ...
+      ]
+    }
+
+Legacy topics (first = largest marker of each kind, for the dashboard):
   aruco/target/{found,data,data_filtered,name,distance}
   aruco/trailer/{found,data,data_filtered,name,distance}
-  camera/params/current   -> laptop dashboard, for display
+
+Also published:
+  camera/compressed, camera/image_raw (optional)
+  camera/params/current
 
 Subscribed topics:
-  camera/params  (String/JSON) — live target/trailer config + FSM-
-                                  relevant tuning (filter_alpha,
-                                  persist_ttl, camera intrinsics,
-                                  marker sizes), sent by the dashboard
-  robot/state    (String)      — from fsm_node, clears temporal
-                                  persistence on GRASP/VERIFY/DEPLOY/DONE
+  camera/params  (String/JSON) — live target/trailer config + tuning
+  robot/state    (String)      — from fsm_node, clears persistence on
+                                  GRASP/VERIFY/DEPLOY/DONE
 """
 
 import json
@@ -149,15 +168,11 @@ def make_entry(
     return entry
 
 
-# Only the tuning that actually affects what the FSM receives. Mask /
-# ROI / visualization tuning now lives entirely on the dashboard.
 ROBOT_PARAMS = {
     "filter_alpha": 0.50,
     "persist_ttl": 1.5,
 }
 
-# Params forwarded from the dashboard's camera/params topic, besides
-# targets/trailers and the ROBOT_PARAMS keys above.
 CAMERA_INTRINSIC_KEYS = (
     "cam_fx", "cam_fy", "cam_cx", "cam_cy", "cam_k1", "cam_k2", "cam_p1", "cam_p2",
     "target_marker_size_m", "trailer_marker_size_m",
@@ -211,20 +226,9 @@ class CameraNode(Node):
                 )
         self._load_config(config_path)
 
-        # EMA + persistence state
-        self._filt = {"target": None, "trailer": None}
-        self._filt_lost = {"target": False, "trailer": False}
-        self._persist = {
-            k: {
-                "found": False,
-                "data": [0.0, 0.0, 0.0, -1.0],
-                "name": "",
-                "corners": None,
-                "dist": -1.0,
-                "ts": 0.0,
-            }
-            for k in ("target", "trailer")
-        }
+        # Per-marker EMA + persistence state, keyed by "kind:dict:id"
+        self._filt = {}
+        self._persist = {}
         self._fsm_state = "UNKNOWN"
         self._NO_PERSIST_STATES = {"GRASP", "VERIFY", "DEPLOY", "DONE"}
         self._CLEAR_ON_ENTER = {"GRASP", "VERIFY", "DEPLOY", "DONE"}
@@ -250,6 +254,8 @@ class CameraNode(Node):
         if self.pub_raw:
             self.raw_pub = self.create_publisher(Image, "camera/image_raw", qos_video)
 
+        self.markers_pub = self.create_publisher(String, "aruco/markers", 10)
+
         self.pub = {}
         for kind in ("target", "trailer"):
             self.pub[f"{kind}_found"] = self.create_publisher(Bool, f"aruco/{kind}/found", 10)
@@ -268,7 +274,6 @@ class CameraNode(Node):
         self._capture_thread = threading.Thread(target=self._capture_loop, daemon=True)
         self._capture_thread.start()
 
-        # Single timer: grabs latest frame, detects markers, publishes.
         self.timer = self.create_timer(1.0 / self.fps, self._process_and_publish)
 
         dicts_in_use = {entry_dict_name(e) for d in (self.targets, self.trailers) for e in d.values()}
@@ -407,9 +412,6 @@ class CameraNode(Node):
         payload["targets"] = self.targets
         payload["trailers"] = self.trailers
         payload["dict_names"] = DICT_NAMES
-        # Also report current camera intrinsics + marker sizes so the
-        # dashboard can display/tune them (they're only set on this
-        # node otherwise, so without this the UI has no value to show).
         payload["cam_fx"] = float(self._K[0, 0])
         payload["cam_fy"] = float(self._K[1, 1])
         payload["cam_cx"] = float(self._K[0, 2])
@@ -423,47 +425,12 @@ class CameraNode(Node):
         msg.data = json.dumps(payload)
         self.params_pub.publish(msg)
 
-    # ── EMA filter ───────────────────────────────────────────────────
-    def _update_filter(self, kind, cx, cy, area, found):
-        alpha = self.p["filter_alpha"]
-        if not found:
-            if self._filt[kind] is not None:
-                self._filt_lost[kind] = True
-            return self._filt[kind]
-        if self._filt[kind] is None or self._filt_lost.get(kind, False):
-            self._filt[kind] = [cx, cy, area]
-            self._filt_lost[kind] = False
-        else:
-            f = self._filt[kind]
-            f[0] = alpha * cx + (1 - alpha) * f[0]
-            f[1] = alpha * cy + (1 - alpha) * f[1]
-            f[2] = alpha * area + (1 - alpha) * f[2]
-        return self._filt[kind]
-
     # ── FSM-state tracking & persistence ─────────────────────────────
     def _cb_fsm_state(self, msg: String):
         new_state = msg.data
         if new_state != self._fsm_state and new_state in self._CLEAR_ON_ENTER:
-            self._clear_persistence("target")
-            self._clear_persistence("trailer")
+            self._persist.clear()
         self._fsm_state = new_state
-
-    def _clear_persistence(self, kind: str):
-        self._persist[kind]["found"] = False
-        self._persist[kind]["ts"] = 0.0
-
-    def _apply_persistence(self, kind, found, data, name, corners, dist):
-        if self._fsm_state in self._NO_PERSIST_STATES:
-            return found, data, name, corners, dist
-        now = time.time()
-        p = self._persist[kind]
-        if found and data[3] >= 0:
-            p.update({"found": True, "data": list(data), "name": name, "corners": corners, "dist": dist, "ts": now})
-            return found, data, name, corners, dist
-        if p["found"] and (now - p["ts"]) < self.p["persist_ttl"]:
-            return True, p["data"], p["name"], p["corners"], p["dist"]
-        p["found"] = False
-        return found, data, name, corners, dist
 
     # ── Detect on image with all needed dicts ─────────────────────────
     def _detect_all(self, gray) -> dict:
@@ -486,53 +453,122 @@ class CameraNode(Node):
             result[dn] = dets
         return result
 
-    # ── Match ─────────────────────────────────────────────────────────
-    def _match(self, det_by_dict: dict, group_dict: dict, use_fallback: bool = False):
-        for name, entry in group_dict.items():
-            dn = entry_dict_name(entry)
-            for det in det_by_dict.get(dn, []):
-                cx, cy, area, mid = det[0], det[1], det[2], det[3]
-                corners = det[4] if len(det) > 4 else None
-                if int(mid) in [int(i) for i in entry_ids(entry)]:
-                    return True, [cx, cy, area, float(mid)], name, corners, entry.get("marker_size_m")
-        if use_fallback:
-            for name, entry in group_dict.items():
-                far_ids = entry.get("far_ids", [])
-                if not far_ids:
-                    continue
-                far_dn = entry.get("far_dict", entry_dict_name(entry))
-                for det in det_by_dict.get(far_dn, []):
-                    cx, cy, area, mid = det[0], det[1], det[2], det[3]
-                    corners = det[4] if len(det) > 4 else None
-                    if int(mid) in [int(i) for i in far_ids]:
-                        return True, [cx, cy, area, float(mid)], name, corners, entry.get("far_marker_size_m")
-        # Not found — no ROI computed on the robot any more, so just
-        # report "nothing" (fsm treats found=False as authoritative
-        # regardless of the placeholder position values).
-        return False, [0.0, 0.0, 0.0, -1.0], "", None, None
+    # ── Build the marker list for this frame ──────────────────────────
+    def _collect(self, det_by_dict: dict) -> list:
+        """All detections that belong to a configured target/trailer group."""
+        markers = []
+        seen = set()
 
-    # ── Main per-frame processing (called from timer, not a subscription) ─
+        def add(kind, name, dn, det, msize, far):
+            cx, cy, area, mid, pts = det
+            key = f"{kind}:{dn}:{mid}"
+            if key in seen:
+                return
+            seen.add(key)
+            markers.append({
+                "key": key,
+                "kind": kind,
+                "name": name,
+                "id": int(mid),
+                "dict": dn,
+                "far": far,
+                "cx": cx,
+                "cy": cy,
+                "area": area,
+                "dist": self._estimate_distance(pts, msize),
+                "persisted": False,
+            })
+
+        for name, entry in self.targets.items():
+            dn = entry_dict_name(entry)
+            ids = {int(i) for i in entry_ids(entry)}
+            msize = entry.get("marker_size_m") or self._target_msize
+            for det in det_by_dict.get(dn, []):
+                if det[3] in ids:
+                    add("target", name, dn, det, msize, False)
+
+        for name, entry in self.trailers.items():
+            dn = entry_dict_name(entry)
+            ids = {int(i) for i in entry_ids(entry)}
+            msize = entry.get("marker_size_m") or self._trailer_msize
+            for det in det_by_dict.get(dn, []):
+                if det[3] in ids:
+                    add("trailer", name, dn, det, msize, False)
+            far_ids = {int(i) for i in entry.get("far_ids", [])}
+            if far_ids:
+                far_dn = entry.get("far_dict", dn)
+                far_msize = entry.get("far_marker_size_m") or msize
+                for det in det_by_dict.get(far_dn, []):
+                    if det[3] in far_ids:
+                        add("trailer", name, far_dn, det, far_msize, True)
+
+        return markers
+
+    # ── Per-marker EMA filter ─────────────────────────────────────────
+    def _apply_filter(self, markers: list):
+        alpha = self.p["filter_alpha"]
+        fresh_keys = {m["key"] for m in markers}
+        # A marker that was lost restarts its filter when it comes back.
+        for k in list(self._filt.keys()):
+            if k not in fresh_keys:
+                del self._filt[k]
+        for m in markers:
+            f = self._filt.get(m["key"])
+            if f is None:
+                f = [m["cx"], m["cy"], m["area"]]
+            else:
+                f = [
+                    alpha * m["cx"] + (1 - alpha) * f[0],
+                    alpha * m["cy"] + (1 - alpha) * f[1],
+                    alpha * m["area"] + (1 - alpha) * f[2],
+                ]
+            self._filt[m["key"]] = f
+            m["cx_f"], m["cy_f"], m["area_f"] = f
+
+    # ── Per-marker persistence ────────────────────────────────────────
+    def _apply_persistence(self, markers: list) -> list:
+        if self._fsm_state in self._NO_PERSIST_STATES:
+            return markers
+        now = time.time()
+        ttl = self.p["persist_ttl"]
+        fresh_keys = set()
+        for m in markers:
+            fresh_keys.add(m["key"])
+            self._persist[m["key"]] = {"m": dict(m), "ts": now}
+        out = list(markers)
+        for k in list(self._persist.keys()):
+            if k in fresh_keys:
+                continue
+            entry = self._persist[k]
+            if now - entry["ts"] < ttl:
+                held = dict(entry["m"])
+                held["persisted"] = True
+                out.append(held)
+            else:
+                del self._persist[k]
+        return out
+
+    # ── Main per-frame processing ─────────────────────────────────────
     def _process_and_publish(self):
         with self._lock:
             frame = self._latest_bgr
         if frame is None:
             return
 
-        now = self.get_clock().now().to_msg()
+        now = self.get_clock().now()
+        stamp = now.to_msg()
 
-        # Publish plain compressed / raw image — the laptop dashboard
-        # uses this to compute all debug visuals itself.
         ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, self.jpeg_quality])
         if ok:
             msg = CompressedImage()
-            msg.header.stamp = now
+            msg.header.stamp = stamp
             msg.header.frame_id = "camera"
             msg.format = "jpeg"
             msg.data = buf.tobytes()
             self.comp_pub.publish(msg)
         if self.pub_raw:
             raw = Image()
-            raw.header.stamp = now
+            raw.header.stamp = stamp
             raw.header.frame_id = "camera"
             raw.height, raw.width = frame.shape[0], frame.shape[1]
             raw.encoding = "bgr8"
@@ -543,37 +579,40 @@ class CameraNode(Node):
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         det_by_dict = self._detect_all(gray)
 
-        # Match — targets: primary only; trailers: primary + far fallback.
-        t_found, t_data, t_name, t_corners, t_msize = self._match(det_by_dict, self.targets, use_fallback=False)
-        tr_found, tr_data, tr_name, tr_corners, tr_msize = self._match(det_by_dict, self.trailers, use_fallback=True)
+        markers = self._collect(det_by_dict)
+        self._apply_filter(markers)
+        markers = self._apply_persistence(markers)
+        markers.sort(key=lambda m: m["area"], reverse=True)
 
-        t_dist = self._estimate_distance(t_corners, t_msize if t_msize is not None else self._target_msize) \
-            if (t_found and t_corners is not None) else -1.0
-        tr_dist = self._estimate_distance(tr_corners, tr_msize if tr_msize is not None else self._trailer_msize) \
-            if (tr_found and tr_corners is not None) else -1.0
+        payload = {
+            "stamp": now.nanoseconds * 1e-9,
+            "markers": [{k: v for k, v in m.items() if k != "key"} for m in markers],
+        }
+        out = String()
+        out.data = json.dumps(payload)
+        self.markers_pub.publish(out)
 
-        t_found, t_data, t_name, t_corners, t_dist = self._apply_persistence("target", t_found, t_data, t_name, t_corners, t_dist)
-        tr_found, tr_data, tr_name, tr_corners, tr_dist = self._apply_persistence("trailer", tr_found, tr_data, tr_name, tr_corners, tr_dist)
+        self._publish_legacy("target", markers)
+        self._publish_legacy("trailer", markers)
 
-        t_filt = self._update_filter("target", t_data[0], t_data[1], t_data[2], t_found)
-        tr_filt = self._update_filter("trailer", tr_data[0], tr_data[1], tr_data[2], tr_found)
-
-        self._publish_result("target", t_found, t_data, t_name, t_filt, t_dist)
-        self._publish_result("trailer", tr_found, tr_data, tr_name, tr_filt, tr_dist)
-
-    # ── Publish ───────────────────────────────────────────────────────
-    def _publish_result(self, kind, found, data, name, filt, dist=-1.0):
-        b = Bool(); b.data = found
+    # ── Legacy single-marker topics (largest of each kind) ────────────
+    def _publish_legacy(self, kind: str, markers: list):
+        m = next((x for x in markers if x["kind"] == kind), None)
+        b = Bool(); b.data = m is not None
         self.pub[f"{kind}_found"].publish(b)
-        fa = Float32MultiArray(); fa.data = [float(v) for v in data]
-        self.pub[f"{kind}_data"].publish(fa)
+        fa = Float32MultiArray()
         ff = Float32MultiArray()
-        ff.data = [float(filt[0]), float(filt[1]), float(filt[2]), float(data[3])] if filt is not None \
-            else [0.0, 0.0, 0.0, float(data[3])]
+        if m is not None:
+            fa.data = [float(m["cx"]), float(m["cy"]), float(m["area"]), float(m["id"])]
+            ff.data = [float(m["cx_f"]), float(m["cy_f"]), float(m["area_f"]), float(m["id"])]
+        else:
+            fa.data = [0.0, 0.0, 0.0, -1.0]
+            ff.data = [0.0, 0.0, 0.0, -1.0]
+        self.pub[f"{kind}_data"].publish(fa)
         self.pub[f"{kind}_data_filt"].publish(ff)
-        s = String(); s.data = name
+        s = String(); s.data = m["name"] if m is not None else ""
         self.pub[f"{kind}_name"].publish(s)
-        dm = Float32(); dm.data = float(dist)
+        dm = Float32(); dm.data = float(m["dist"]) if m is not None else -1.0
         self.pub[f"{kind}_distance"].publish(dm)
 
     # ── Cleanup ───────────────────────────────────────────────────────
